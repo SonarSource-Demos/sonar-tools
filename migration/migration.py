@@ -22,7 +22,7 @@
     Exports SonarQube platform configuration as JSON
 """
 import sys
-
+from sonar.report import html_export
 from cli import options
 from sonar import exceptions, errcodes, utilities, version
 import sonar.logging as log
@@ -69,7 +69,7 @@ __MAP = {
 def __parse_args(desc):
     parser = options.set_common_args(desc)
     parser = options.set_key_arg(parser)
-    parser = options.set_output_file_args(parser, allowed_formats=("json",))
+    parser = options.set_output_file_args(parser, allowed_formats=("json", "html"))
     parser = options.add_thread_arg(parser, "migration export")
     parser = options.set_what(parser, what_list=_EVERYTHING, operation="export")
     parser = options.add_import_export_arg(parser, "migration")
@@ -86,10 +86,15 @@ def __parse_args(desc):
     return args
 
 
-def __write_export(config: dict[str, str], file: str) -> None:
+def __write_export(file_format:str, config: dict[str, str], file: str) -> None:
     """Writes the configuration in file"""
     with utilities.open_file(file) as fd:
-        print(utilities.json_dump(config), file=fd)
+        if file_format == 'json':
+            print(utilities.json_dump(config), file=fd)
+        elif file_format == 'html':
+            html_export(file_pointer=fd, config=config)
+
+
 
 
 def __export_config(endpoint: platform.Platform, what: list[str], **kwargs) -> None:
@@ -133,7 +138,7 @@ def __export_config(endpoint: platform.Platform, what: list[str], **kwargs) -> N
     sq_settings = utilities.remove_empties(sq_settings)
     # if not kwargs.get("dontInlineLists", False):
     #    sq_settings = utilities.inline_lists(sq_settings, exceptions=("conditions",))
-    __write_export(sq_settings, kwargs[options.REPORT_FILE])
+    __write_export(file_format=options.FORMAT, config=sq_settings, file=kwargs[options.REPORT_FILE])
 
 
 def main() -> None:
@@ -150,9 +155,9 @@ def main() -> None:
     what = utilities.check_what(kwargs.pop(options.WHAT, None), _EVERYTHING, "exported")
     if options.WHAT_PROFILES in what and options.WHAT_RULES not in what:
         what.append(options.WHAT_RULES)
-    kwargs[options.FORMAT] = "json"
+    kwargs[options.FORMAT] = "json" if kwargs[options.FORMAT] is None else kwargs[options.FORMAT]
     if kwargs[options.REPORT_FILE] is None:
-        kwargs[options.REPORT_FILE] = f"sonar-migration.{endpoint.server_id()}.json"
+        kwargs[options.REPORT_FILE] = f"sonar-migration.{endpoint.server_id()}.{options.FORMAT}"
     try:
         __export_config(endpoint, what, **kwargs)
     except exceptions.ObjectNotFound as e:
