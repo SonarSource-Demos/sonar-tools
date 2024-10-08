@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import date, datetime, timedelta
 import json
 import re
@@ -34,7 +35,7 @@ import sonar.logging as log
 import sonar.platform as pf
 from sonar.util.types import ApiParams, ApiPayload, ObjectJsonRepr, ConfigSettings
 
-from sonar import users, syncer, sqobject, findings, changelog, projects
+from sonar import users, sqobject, findings, changelog, projects
 import sonar.utilities as util
 
 API_SET_TAGS = "issues/set_tags"
@@ -42,6 +43,12 @@ API_SET_TYPE = "issues/set_type"
 
 COMPONENT_FILTER_OLD = "componentKeys"
 COMPONENT_FILTER = "components"
+
+OLD_STATUS = "resolutions"
+NEW_STATUS = "issueStatuses"
+
+OLD_FP = "FALSE-POSITIVE"
+NEW_FP = "FALSE_POSITIVE"
 
 _SEARCH_CRITERIAS = (
     COMPONENT_FILTER_OLD,
@@ -77,18 +84,17 @@ _SEARCH_CRITERIAS = (
     "author",
     "issues",
     "languages",
-    "resolutions",
+    OLD_STATUS,
     "resolved",
     "rules",
     "scopes",
     # 10.2 new filter
     "impactSeverities",
     # 10.4 new filter
-    "issueStatuses",
+    NEW_STATUS,
 )
 
 _FILTERS_10_2_REMAPPING = {"severities": "impactSeverities"}
-_FILTERS_10_4_REMAPPING = {"statuses": "issueStatuses"}
 
 TYPES = ("BUG", "VULNERABILITY", "CODE_SMELL")
 SEVERITIES = ("BLOCKER", "CRITICAL", "MAJOR", "MINOR", "INFO")
@@ -102,7 +108,7 @@ FILTERS_MAP = {
     "impactSoftwareQualities": IMPACT_SOFTWARE_QUALITIES,
     "impactSeverities": IMPACT_SEVERITIES,
     "statuses": STATUSES,
-    "resolutions": RESOLUTIONS,
+    OLD_STATUS: RESOLUTIONS,
 }
 
 _TOO_MANY_ISSUES_MSG = "Too many issues, recursing..."
@@ -336,7 +342,7 @@ class Issue(findings.Finding):
         :return: Whether the issue is won't fix
         :rtype: bool
         """
-        return self.resolution == "WONT-FIX"
+        return self.resolution == "WONTFIX"
 
     def is_accepted(self) -> bool:
         """
@@ -350,7 +356,7 @@ class Issue(findings.Finding):
         :return: Whether the issue is a false positive
         :rtype: bool
         """
-        return self.resolution == "FALSE-POSITIVE"
+        return self.resolution in ("FALSE-POSITIVE", "FALSE_POSITIVE")
 
     def strictly_identical_to(self, another_finding: Issue, ignore_component: bool = False) -> bool:
         """
@@ -430,6 +436,8 @@ class Issue(findings.Finding):
         return self.do_transition("accept")
 
     def __apply_event(self, event: str, settings: ConfigSettings) -> bool:
+        from sonar import syncer
+
         log.debug("Applying event %s", str(event))
         # origin = f"originally by *{event['userName']}* on original branch"
         (event_type, data) = event.changelog_type()
@@ -445,7 +453,7 @@ class Issue(findings.Finding):
             else:
                 self.reopen()
             # self.add_comment(f"Issue re-open {origin}", settings[SYNC_ADD_COMMENTS])
-        elif event_type == "FALSE-POSITIVE":
+        elif event_type in ("FALSE-POSITIVE", "FALSE_POSITIVE"):
             self.mark_as_false_positive()
             # self.add_comment(f"False positive {origin}", settings[SYNC_ADD_COMMENTS])
         elif event_type == "WONT-FIX":
@@ -491,6 +499,8 @@ class Issue(findings.Finding):
         """
         :meta private:
         """
+        from sonar import syncer
+
         events = source_issue.changelog()
         if events is None or not events:
             log.debug("Sibling %s has no changelog, no action taken", source_issue.key)
@@ -587,7 +597,9 @@ def __search_all_by_severities(endpoint: pf.Platform, params: ApiParams) -> dict
     return issue_list
 
 
-def __search_all_by_date(endpoint: pf.Platform, params: ApiParams, date_start: date = None, date_stop: date = None) -> dict[str, Issue]:
+def __search_all_by_date(
+    endpoint: pf.Platform, params: ApiParams, date_start: Optional[date] = None, date_stop: Optional[date] = None
+) -> dict[str, Issue]:
     """Searches issues splitting by date windows to avoid exceeding the 10K limit"""
     new_params = params.copy()
     if date_start is None:
@@ -598,11 +610,15 @@ def __search_all_by_date(endpoint: pf.Platform, params: ApiParams, date_start: d
         date_stop = get_newest_issue(endpoint=endpoint, params=new_params).replace(hour=0, minute=0, second=0, microsecond=0)
         if isinstance(date_stop, datetime):
             date_stop = date_stop.date()
-    log.info("Splitting search by date between [%s - %s]", util.date_to_string(date_start, False), util.date_to_string(date_stop, False))
-    issue_list = {}
-    new_params.update(
-        {"createdAfter": util.date_to_string(date_start, with_time=False), "createdBefore": util.date_to_string(date_stop, with_time=False)}
+    log.info(
+        "Project '%s' Splitting search by date between [%s - %s]",
+        params["project"],
+        util.date_to_string(date_start, False),
+        util.date_to_string(date_stop, False),
     )
+    issue_list = {}
+    new_params["createdAfter"] = util.date_to_string(date_start, with_time=False)
+    new_params["createdBefore"] = util.date_to_string(date_stop, with_time=False)
     try:
         issue_list = search(endpoint=endpoint, params=new_params)
     except TooManyIssuesError as e:
@@ -621,8 +637,8 @@ def __search_all_by_date(endpoint: pf.Platform, params: ApiParams, date_start: d
             issue_list.update(__search_all_by_date(endpoint=endpoint, params=new_params, date_start=date_middle, date_stop=date_stop))
     if date_start is not None and date_stop is not None:
         log.debug(
-            "Project %s has %d issues between %s and %s",
-            new_params[component_filter(endpoint)],
+            "Project '%s' has %d issues between %s and %s",
+            params["project"],
             len(issue_list),
             util.date_to_string(date_start, False),
             util.date_to_string(date_stop, False),
@@ -633,7 +649,7 @@ def __search_all_by_date(endpoint: pf.Platform, params: ApiParams, date_start: d
 def __search_all_by_project(endpoint: pf.Platform, project_key: str, params: ApiParams = None) -> dict[str, Issue]:
     """Search issues by project"""
     new_params = {} if params is None else params.copy()
-    new_params[component_filter(endpoint)] = project_key
+    new_params["project"] = project_key
     issue_list = {}
     log.debug("Searching for issues of project '%s'", project_key)
     try:
@@ -683,17 +699,22 @@ def search_all(endpoint: pf.Platform, params: ApiParams = None) -> dict[str, Iss
     :rtype: dict{<key>: <Issue>}
     """
     issue_list = {}
+    new_params = params.copy() if params else {}
+    new_params["ps"] = Issue.MAX_PAGE_SIZE
     try:
-        issue_list = search(endpoint=endpoint, params=params)
+        issue_list = search(endpoint=endpoint, params=new_params.copy())
     except TooManyIssuesError:
         log.info(_TOO_MANY_ISSUES_MSG)
         comp_filter = component_filter(endpoint)
-        if params and comp_filter in params:
+        if params and "project" in params:
+            key_list = util.csv_to_list(params["project"])
+        elif params and comp_filter in params:
             key_list = util.csv_to_list(params[comp_filter])
         else:
             key_list = projects.search(endpoint).keys()
         for k in key_list:
-            issue_list.update(__search_all_by_project(endpoint=endpoint, project_key=k, params=params))
+            issue_list.update(__search_all_by_project(endpoint=endpoint, project_key=k, params=new_params))
+    log.debug("SEARCH ALL %s returns %d issues", str(params), len(issue_list))
     return issue_list
 
 
@@ -740,21 +761,14 @@ def search(endpoint: pf.Platform, params: ApiParams = None, raise_error: bool = 
     :rtype: dict{<key>: <Issue>}
     :raises: TooManyIssuesError if more than 10'000 issues found
     """
-    filters = pre_search_filters(endpoint=endpoint, params=params)
-    # if endpoint.version() >= (10, 2, 0):
-    #     new_params = util.dict_remap_and_stringify(new_params, _FILTERS_10_2_REMAPPING)
-    if endpoint.version() >= (10, 4, 0):
-        filters = _change_filters_for_10_4(filters)
-
-    log.debug("Search filters = %s", str(filters))
-    if not filters:
-        filters = {"ps": Issue.MAX_PAGE_SIZE}
-    elif "ps" not in filters:
+    filters = pre_search_filters(endpoint=endpoint, params=params.copy())
+    if "ps" not in filters:
         filters["ps"] = Issue.MAX_PAGE_SIZE
 
+    log.debug("Search filters = %s", str(filters))
     issue_list = {}
     data = json.loads(endpoint.get(Issue.SEARCH_API, params=filters).text)
-    nbr_issues = data["paging"]["total"]
+    nbr_issues = util.nbr_total_elements(data)
     nbr_pages = util.nbr_pages(data)
     log.debug("Number of issues: %d - Nbr pages: %d", nbr_issues, nbr_pages)
 
@@ -771,8 +785,9 @@ def search(endpoint: pf.Platform, params: ApiParams = None, raise_error: bool = 
     if nbr_pages == 1:
         return issue_list
     q = Queue(maxsize=0)
+    prepared_params = pre_search_filters(endpoint=endpoint, params=params)
     for page in range(2, nbr_pages + 1):
-        q.put((endpoint, Issue.SEARCH_API, issue_list, filters, page))
+        q.put((endpoint, Issue.SEARCH_API, issue_list, prepared_params, page))
     for i in range(threads):
         log.debug("Starting issue search thread %d", i)
         worker = Thread(target=__search_thread, args=[q])
@@ -815,15 +830,33 @@ def get_newest_issue(endpoint: pf.Platform, params: ApiParams = None) -> Union[d
 
 def count(endpoint: pf.Platform, **kwargs) -> int:
     """Returns number of issues of a search"""
-    params = {} if not kwargs else kwargs.copy()
-    params["ps"] = 1
-    try:
-        log.info("Count params = %s", str(params))
-        nbr_issues = len(search(endpoint=endpoint, params=params))
-    except TooManyIssuesError as e:
-        nbr_issues = e.nbr_issues
-    log.debug("Issue search %s would return %d issues", str(kwargs), nbr_issues)
+    filters = pre_search_filters(endpoint=endpoint, params=kwargs)
+    filters["ps"] = 1
+    nbr_issues = util.nbr_total_elements(json.loads(endpoint.get(Issue.SEARCH_API, params=filters).text))
+    log.debug("Count issues with filters %s returned %d issues", str(kwargs), nbr_issues)
     return nbr_issues
+
+
+def count_by_rule(endpoint: pf.Platform, **kwargs) -> dict[str, int]:
+    """Returns number of issues of a search"""
+    nbr_slices = 1
+    SLICE_SIZE = 50  # Search rules facets by bulks of 50
+    if "rules" in kwargs:
+        ruleset = kwargs.pop("rules")
+        nbr_slices = math.ceil(len(ruleset) / SLICE_SIZE)
+    params = pre_search_filters(endpoint=endpoint, params=kwargs)
+    params.update({"ps": 1, "facets": "rules"})
+    rulecount = {}
+    for i in range(nbr_slices):
+        params["rules"] = ",".join(ruleset[i * SLICE_SIZE : min((i + 1) * SLICE_SIZE - 1, len(ruleset))])
+        data = json.loads(endpoint.get(Issue.SEARCH_API, params=params).text)["facets"][0]["values"]
+        for d in data:
+            if d["val"] not in ruleset:
+                continue
+            if d["val"] not in rulecount:
+                rulecount[d["val"]] = 0
+            rulecount[d["val"]] += d["count"]
+    return rulecount
 
 
 def get_object(endpoint: pf.Platform, key: str, data: ApiPayload = None, from_export: bool = False) -> Issue:
@@ -838,42 +871,38 @@ def pre_search_filters(endpoint: pf.Platform, params: ApiParams) -> ApiParams:
     """Returns the filtered list of params that are allowed for api/issue/search"""
     if not params:
         return {}
-    filters = util.dict_subset(util.remove_nones(params.copy()), _SEARCH_CRITERIAS)
-    if endpoint.version() >= (10, 2, 0):
-        if COMPONENT_FILTER_OLD in filters:
-            filters[COMPONENT_FILTER] = filters.pop(COMPONENT_FILTER_OLD)
-        if "types" in filters:
-            __MAP = {"BUG": "RELIABILITY", "CODE_SMELL": "MAINTAINABILITY", "VULNERABILITY": "SECURITY", "SECURITY_HOTSPOT": "SECURITY"}
-            filters["impactSoftwareQualities"] = [__MAP[t] for t in filters.pop("types")]
-            if len(filters["impactSoftwareQualities"]) == 0:
-                filters.pop("impactSoftwareQualities")
-        if "severities" in filters:
-            __MAP = {"BLOCKER": "HIGH", "CRITICAL": "HIGH", "MAJOR": "MEDIUM", "MINOR": "LOW", "INFO": "LOW"}
-            filters["impactSeverities"] = [__MAP[t] for t in filters.pop("severities")]
-            if len(filters["impactSeverities"]) == 0:
-                filters.pop("impactSeverities")
-    for k, v in FILTERS_MAP.items():
-        if k in filters:
-            filters[k] = util.allowed_values_string(filters[k], v)
-    if filters.get("languages", None) is not None:
-        filters["languages"] = util.list_to_csv(filters["languages"])
+    log.debug("Sanitizing issue search filters %s", str(params))
+    version = endpoint.version()
+    filters = util.dict_remap(
+        original_dict=params.copy(), remapping={"project": COMPONENT_FILTER, "application": COMPONENT_FILTER, "portfolio": COMPONENT_FILTER}
+    )
+    filters = util.dict_subset(util.remove_nones(filters), _SEARCH_CRITERIAS)
+    if version < (10, 2, 0):
+        # Starting from 10.2 - "componentKeys" was renamed "components"
+        filters = util.dict_remap(original_dict=filters, remapping={COMPONENT_FILTER: COMPONENT_FILTER_OLD})
+    else:
+        # Starting from 10.2 - Issue types were replaced by software qualities, and severities replaced by impacts
+        __MAP = {"BUG": "RELIABILITY", "CODE_SMELL": "MAINTAINABILITY", "VULNERABILITY": "SECURITY", "SECURITY_HOTSPOT": "SECURITY"}
+        filters["impactSoftwareQualities"] = util.list_re_value(filters.pop("types", None), __MAP)
+        if len(filters["impactSoftwareQualities"]) == 0:
+            filters.pop("impactSoftwareQualities")
+        __MAP = {"BLOCKER": "HIGH", "CRITICAL": "HIGH", "MAJOR": "MEDIUM", "MINOR": "LOW", "INFO": "LOW"}
+        filters["impactSeverities"] = util.list_re_value(filters.pop("severities", None), __MAP)
+        if len(filters["impactSeverities"]) == 0:
+            filters.pop("impactSeverities")
 
+    if version < (10, 4, 0):
+        log.debug("Sanitizing issue search filters - fixing resolutions")
+        filters = util.dict_remap(original_dict=filters, remapping={NEW_STATUS: OLD_STATUS})
+        if OLD_STATUS in filters:
+            filters[OLD_STATUS] = util.list_re_value(filters[OLD_STATUS], mapping={NEW_FP: OLD_FP})
+    else:
+        # Starting from 10.4 - "resolutions" was renamed "issuesStatuses", "FALSE-POSITIVE" was renamed "FALSE_POSITIVE"
+        filters = util.dict_remap(original_dict=filters, remapping={OLD_STATUS: NEW_STATUS})
+        if NEW_STATUS in filters:
+            filters[NEW_STATUS] = util.list_re_value(filters[NEW_STATUS], mapping={OLD_FP: NEW_FP})
+
+    filters = {k: util.allowed_values_string(v, FILTERS_MAP[k]) if k in FILTERS_MAP else v for k, v in filters.items()}
+    filters = {k: util.list_to_csv(v) for k, v in filters.items() if v}
+    log.debug("Sanitized issue search filters %s", str(filters))
     return filters
-
-
-def _change_filters_for_10_4(filters: ApiParams) -> ApiParams:
-    """Adjust filters for new 10.4 issues/search API parameters"""
-    if not filters:
-        return None
-    new_filters = util.dict_remap(filters.copy(), _FILTERS_10_4_REMAPPING)
-    statuses = []
-    for f in "resolutions", "issueStatuses":
-        if f in new_filters:
-            statuses += util.csv_to_list(new_filters[f])
-    new_filters.pop("resolutions", None)
-    if len(statuses) > 0:
-        if "FALSE-POSITIVE" in statuses:
-            statuses.remove("FALSE-POSITIVE")
-            statuses.append("FALSE_POSITIVE")
-        new_filters["issueStatuses"] = util.list_to_csv(statuses)
-    return new_filters

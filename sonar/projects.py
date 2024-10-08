@@ -42,7 +42,7 @@ import sonar.platform as pf
 from sonar.util import types
 
 from sonar import exceptions, errcodes
-from sonar import sqobject, components, qualitygates, qualityprofiles, tasks, settings, webhooks, devops, syncer
+from sonar import sqobject, components, qualitygates, qualityprofiles, tasks, settings, webhooks, devops
 import sonar.permissions.permissions as perms
 from sonar import pull_requests, branches
 import sonar.utilities as util
@@ -80,6 +80,46 @@ _IMPORTABLE_PROPERTIES = (
     "webhooks",
 )
 
+_UNNEEDED_CONTEXT_DATA = (
+    "sonar.announcement.message",
+    "sonar.auth.github.allowUsersToSignUp",
+    "sonar.auth.github.apiUrl",
+    "sonar.auth.github.appId",
+    "sonar.auth.github.enabled",
+    "sonar.auth.github.groupsSync",
+    "sonar.auth.github.organizations",
+    "sonar.auth.github.webUrl",
+    "sonar.builtInQualityProfiles.disableNotificationOnUpdate",
+    "sonar.core.id",
+    "sonar.core.serverBaseURL",
+    "sonar.core.startTime",
+    "sonar.dbcleaner.branchesToKeepWhenInactive",
+    "sonar.forceAuthentication",
+    "sonar.host.url",
+    "sonar.java.jdkHome",
+    "sonar.links.ci",
+    "sonar.links.homepage",
+    "sonar.links.issue",
+    "sonar.links.scm",
+    "sonar.links.scm_dev",
+    "sonar.plugins.risk.consent",
+)
+
+_UNNEEDED_TASK_DATA = (
+    "analysisId",
+    "componentId",
+    "hasScannerContext",
+    "id",
+    "warningCount",
+    "componentQualifier",
+    "nodeName",
+    "componentName",
+    "componentKey",
+    "submittedAt",
+    "executedAt",
+    "type",
+)
+
 
 class Project(components.Component):
     """
@@ -104,6 +144,8 @@ class Project(components.Component):
         self._ncloc_with_branches = None
         self._binding = {"has_binding": True, "binding": None}
         self._new_code = None
+        self._ci = None
+        self._revision = None
         _OBJECTS[self.uuid()] = self
         log.debug("Created object %s", str(self))
 
@@ -212,7 +254,7 @@ class Project(components.Component):
             self._last_analysis = util.string_to_date(data["analysisDate"])
         else:
             self._last_analysis = None
-        self.revision = data.get("revision", None)
+        self._revision = data.get("revision", self._revision)
         return self
 
     def url(self) -> str:
@@ -550,13 +592,43 @@ class Project(components.Component):
                 return "CLI"
         return "UNKNOWN"
 
+    def last_task(self) -> Optional[tasks.Task]:
+        """Returns the last analysis background task of a problem, or none if not found"""
+        return tasks.search_last(component_key=self.key, endpoint=self.endpoint, type="REPORT")
+
+    def task_history(self) -> Optional[tasks.Task]:
+        """Returns the last analysis background task of a problem, or none if not found"""
+        return tasks.search_all(component_key=self.key, endpoint=self.endpoint, type="REPORT")
+
     def scanner(self) -> str:
         """Returns the project type (MAVEN, GRADLE, DOTNET, OTHER, UNKNOWN)"""
-        last_task = tasks.search_last(component_key=self.key, endpoint=self.endpoint)
+        last_task = self.last_task()
         if not last_task:
             return "UNKNOWN"
         last_task.concerned_object = self
         return last_task.scanner()
+
+    def ci(self) -> str:
+        """Returns the detected CI tool used, or undetected, or unknown if HTTP request fails"""
+        log.debug("Collecting detected CI")
+        if not self._ci or not self._revision:
+            self._ci, self._revision = "unknown", "unknown"
+            try:
+                data = json.loads(self.get("project_analyses/search", params={"project": self.key, "ps": 1}).text)["analyses"]
+                if len(data) > 0:
+                    self._ci, self._revision = data[0].get("detectedCI", "unknown"), data[0].get("revision", "unknown")
+            except HTTPError:
+                log.warning("HTTP Error, can't retrieve CI tool and revision")
+            except KeyError:
+                log.warning("KeyError, can't retrieve CI tool and revision")
+        return self._ci
+
+    def revision(self) -> str:
+        """Returns the last analysis commit, or unknown if HTTP request fails or no revision"""
+        log.debug("Collecting revision")
+        if not self._revision:
+            self.ci()
+        return self._revision
 
     def __audit_scanner(self, audit_settings: types.ConfigSettings) -> list[Problem]:
         proj_type, scanner = self.get_type(), self.scanner()
@@ -751,8 +823,24 @@ class Project(components.Component):
                 findings_list = {**findings_list, **comp.get_issues()}
         return findings_list
 
+    def count_third_party_issues(self, filters: dict[str, str] = None) -> dict[str, int]:
+        branches_or_prs = self.get_branches_and_prs(filters)
+        if branches_or_prs is None:
+            return super().count_third_party_issues(filters)
+        issue_counts = {}
+        for comp in branches_or_prs.values():
+            if not comp:
+                continue
+            for k, total in comp.count_third_party_issues(filters):
+                if k not in issue_counts:
+                    issue_counts[k] = 0
+                issue_counts[k] += total
+        return issue_counts
+
     def __sync_community(self, another_project: object, sync_settings: types.ConfigSettings) -> tuple[list[dict[str, str]], dict[str, int]]:
         """Syncs 2 projects findings on a community edition"""
+        from sonar import syncer
+
         report, counters = [], {}
         log.info("Syncing %s and %s issues", str(self), str(another_project))
         (report, counters) = syncer.sync_lists(
@@ -899,6 +987,27 @@ class Project(components.Component):
             return None
         return util.remove_nones(branch_data)
 
+    def migration_export(self, export_settings: types.ConfigSettings) -> types.ObjectJsonRepr:
+        """Produces the data that is exported for SQ to SC migration"""
+        json_data = super().migration_export(export_settings)
+        json_data["detectedCi"] = self.ci()
+        json_data["revision"] = self.revision()
+        last_task = self.last_task()
+        json_data["backgroundTasks"] = {}
+        if last_task:
+            ctxt = last_task.scanner_context()
+            if ctxt:
+                ctxt = {k: v for k, v in ctxt.items() if k not in _UNNEEDED_CONTEXT_DATA}
+            t_hist = []
+            for t in self.task_history():
+                t_hist.append({k: v for k, v in t._json.items() if k not in _UNNEEDED_TASK_DATA})
+            json_data["backgroundTasks"] = {
+                "lastTaskScannerContext": ctxt,
+                # "lastTaskWarnings": last_task.warnings(),
+                "taskHistory": t_hist,
+            }
+        return json_data
+
     def export(self, export_settings: types.ConfigSettings, settings_list: dict[str, str] = None) -> types.ObjectJsonRepr:
         """Exports the entire project configuration as JSON
 
@@ -906,9 +1015,9 @@ class Project(components.Component):
         :rtype: dict
         """
         log.info("Exporting %s", str(self))
+        json_data = self._json.copy()
+        json_data.update({"key": self.key, "name": self.name})
         try:
-            json_data = self._json.copy()
-            json_data.update({"key": self.key, "name": self.name})
             json_data["binding"] = self.__export_get_binding()
             nc = self.new_code()
             if nc != "":
@@ -927,6 +1036,10 @@ class Project(components.Component):
             if hooks is not None:
                 json_data["webhooks"] = hooks
             json_data = util.filter_export(json_data, _IMPORTABLE_PROPERTIES, export_settings.get("FULL_EXPORT", False))
+
+            if export_settings.get("MODE", "") == "MIGRATION":
+                json_data.update(self.migration_export(export_settings))
+
             settings_dict = settings.get_bulk(endpoint=self.endpoint, component=self, settings_list=settings_list, include_not_set=False)
             # json_data.update({s.to_json() for s in settings_dict.values() if include_inherited or not s.inherited})
             for s in settings_dict.values():
@@ -935,10 +1048,18 @@ class Project(components.Component):
                 json_data.update(s.to_json())
         except HTTPError as e:
             if e.response.status_code == HTTPStatus.FORBIDDEN:
-                log.critical("Insufficient privileges to access %s, export of this project skipped", str(self))
+                log.critical("Insufficient privileges to access %s, export of this project interrupted", str(self))
+                json_data["error"] = "Insufficient permissions while exporting project, export interrupted"
             else:
-                log.critical("HTTP error %s while exporting %s, export of this project skipped", str(e), str(self))
-            json_data = {}
+                log.critical("HTTP error %s while exporting %s, export of this project interrupted", str(e), str(self))
+                json_data["error"] = f"HTTP error {str(e)} while extracting project"
+        except ConnectionError as e:
+            log.critical("Connecting error %s while exporting %s, export of this project interrupted", str(self), str(e))
+            json_data["error"] = f"Connection error {str(e)} while extracting project, export interrupted"
+        except Exception as e:
+            log.critical("Connecting error %s while exporting %s, export of this project interrupted", str(self), str(e))
+            json_data["error"] = f"Exception {str(e)} while exporting project, export interrupted"
+        log.debug("Exporting %s done", str(self))
         return util.remove_nones(json_data)
 
     def new_code(self) -> str:
@@ -1258,8 +1379,7 @@ def count(endpoint: pf.Platform, params: types.ApiParams = None) -> int:
     """
     new_params = {} if params is None else params.copy()
     new_params.update({"ps": 1, "p": 1})
-    data = json.loads(endpoint.get(Project.SEARCH_API, params=params).text)
-    return data["paging"]["total"]
+    util.nbr_total_elements(json.loads(endpoint.get(Project.SEARCH_API, params=params).text))
 
 
 def search(endpoint: pf.Platform, params: types.ApiParams = None) -> dict[str, Project]:
@@ -1353,16 +1473,27 @@ def audit(endpoint: pf.Platform, audit_settings: types.ConfigSettings, key_list:
     return problems
 
 
-def __export_thread(queue: Queue[Project], results: dict[str, str], export_settings: types.ConfigSettings) -> None:
+def __export_thread(queue: Queue[Project], results: dict[str, str], export_settings: types.ConfigSettings, write_q: Optional[Queue] = None) -> None:
     """Project export callback function for multitheaded export"""
     while not queue.empty():
         project = queue.get()
-        results[project.key] = project.export(export_settings=export_settings)
-        results[project.key].pop("key", None)
+        exp_json = project.export(export_settings=export_settings)
+        if write_q:
+            write_q.put(exp_json)
+        else:
+            results[project.key] = exp_json
+            results[project.key].pop("key", None)
+        with _CLASS_LOCK:
+            export_settings["EXPORTED"] += 1
+        nb, tot = export_settings["EXPORTED"], export_settings["NBR_PROJECTS"]
+        if nb % 10 == 0 or nb == tot:
+            log.info("%d/%d projects exported (%d%%)", nb, tot, (nb * 100) // tot)
         queue.task_done()
 
 
-def export(endpoint: pf.Platform, export_settings: types.ConfigSettings, key_list: types.KeyList = None) -> types.ObjectJsonRepr:
+def export(
+    endpoint: pf.Platform, export_settings: types.ConfigSettings, key_list: Optional[types.KeyList] = None, write_q: Optional[Queue] = None
+) -> types.ObjectJsonRepr:
     """Exports all or a list of projects configuration as dict
 
     :param Platform endpoint: reference to the SonarQube platform
@@ -1375,16 +1506,22 @@ def export(endpoint: pf.Platform, export_settings: types.ConfigSettings, key_lis
         qp.projects()
 
     q = Queue(maxsize=0)
-    for p in get_list(endpoint=endpoint, key_list=key_list).values():
+    proj_list = get_list(endpoint=endpoint, key_list=key_list)
+    export_settings["NBR_PROJECTS"] = len(proj_list)
+    export_settings["EXPORTED"] = 0
+    log.info("Exporting %d projects", export_settings["NBR_PROJECTS"])
+    for p in proj_list.values():
         q.put(p)
     project_settings = {}
     for i in range(export_settings.get("THREADS", 8)):
         log.debug("Starting project export thread %d", i)
-        worker = Thread(target=__export_thread, args=(q, project_settings, export_settings))
-        worker.setDaemon(True)
-        worker.setName(f"ProjectExport{i}")
+        worker = Thread(target=__export_thread, args=(q, project_settings, export_settings, write_q))
+        worker.daemon = True
+        worker.name = f"ProjectExport{i}"
         worker.start()
     q.join()
+    if write_q:
+        write_q.put(None)
     return dict(sorted(project_settings.items()))
 
 

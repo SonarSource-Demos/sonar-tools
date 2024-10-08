@@ -23,6 +23,7 @@
 
 """
 from __future__ import annotations
+from queue import Queue
 import json
 from typing import Optional
 from http import HTTPStatus
@@ -40,6 +41,54 @@ _UPDATE_API = "rules/update"
 _CREATE_API = "rules/create"
 
 TYPES = ("BUG", "VULNERABILITY", "CODE_SMELL", "SECURITY_HOTSPOT")
+
+SONAR_REPOS = {
+    "abap",
+    "apex",
+    "azureresourcemanager",
+    "c",
+    "cloudformation",
+    "cobol",
+    "cpp",
+    "csharpsquid",
+    "roslyn.sonaranalyzer.security.cs",
+    "css",
+    "dart",
+    "docker",
+    "flex",
+    "go",
+    "java",
+    "javabugs",
+    "javasecurity",
+    "javascript",
+    "jssecurity",
+    "jcl",
+    "kotlin",
+    "kubernetes",
+    "objc",
+    "php",
+    "phpsecurity",
+    "pli",
+    "plsql",
+    "python",
+    "pythonbugs",
+    "pythonsecurity",
+    "ipython",
+    "rpg",
+    "ruby",
+    "scala",
+    "secrets",
+    "swift",
+    "terraform",
+    "text",
+    "tsql",
+    "typescript",
+    "tssecurity",
+    "vb",
+    "vbnet",
+    "Web",
+    "xml",
+}
 
 
 class Rule(sq.SqObject):
@@ -203,9 +252,11 @@ def count(endpoint: platform.Platform, **params) -> int:
     return json.loads(endpoint.get(Rule.SEARCH_API, params={**params, "ps": 1}).text)["total"]
 
 
-def get_list(endpoint: platform.Platform, **params) -> dict[str, Rule]:
+def get_list(endpoint: platform.Platform, use_cache: bool = True, **params) -> dict[str, Rule]:
     """Returns a list of rules corresponding to certain csearch filters"""
-    return search(endpoint, include_external="false", **params)
+    if not use_cache or params or len(_OBJECTS) < 100:
+        return search(endpoint, include_external="false", **params)
+    return _OBJECTS
 
 
 def get_object(endpoint: platform.Platform, key: str) -> Optional[Rule]:
@@ -223,12 +274,14 @@ def get_object(endpoint: platform.Platform, key: str) -> Optional[Rule]:
         return None
 
 
-def export(endpoint: platform.Platform, export_settings: types.ConfigSettings, key_list: types.KeyList = None) -> types.ObjectJsonRepr:
+def export(
+    endpoint: platform.Platform, export_settings: types.ConfigSettings, key_list: Optional[types.KeyList] = None, write_q: Optional[Queue] = None
+) -> types.ObjectJsonRepr:
     """Returns a JSON export of all rules"""
     log.info("Exporting rules")
     full = export_settings.get("FULL_EXPORT", False)
     rule_list, other_rules, instantiated_rules, extended_rules = {}, {}, {}, {}
-    for rule_key, rule in get_list(endpoint=endpoint).items():
+    for rule_key, rule in get_list(endpoint=endpoint, use_cache=False).items():
         rule_export = rule.export(full)
         if rule.template_key is not None:
             instantiated_rules[rule_key] = rule_export
@@ -249,6 +302,11 @@ def export(endpoint: platform.Platform, export_settings: types.ConfigSettings, k
         rule_list["extended"] = extended_rules
     if len(other_rules) > 0 and full:
         rule_list["standard"] = other_rules
+    if export_settings.get("MODE", "") == "MIGRATION":
+        rule_list["thirdParty"] = {r.key: r.export() for r in third_party(endpoint=endpoint)}
+    if write_q:
+        write_q.put(rule_list)
+        write_q.put(None)
     return rule_list
 
 
@@ -260,7 +318,7 @@ def import_config(endpoint: platform.Platform, config_data: types.ObjectJsonRepr
     if endpoint.is_sonarcloud():
         raise exceptions.UnsupportedOperation("Can't import rules in SonarCloud")
     log.info("Importing customized (custom tags, extended description) rules")
-    get_list(endpoint=endpoint)
+    get_list(endpoint=endpoint, use_cache=False)
     for key, custom in config_data["rules"].get("extended", {}).items():
         try:
             rule = Rule.get_object(endpoint, key)
@@ -270,8 +328,6 @@ def import_config(endpoint: platform.Platform, config_data: types.ObjectJsonRepr
         rule.set_description(custom.get("description", ""))
         rule.set_tags(utilities.csv_to_list(custom.get("tags", None)))
 
-    log.debug("get_list from import")
-    get_list(endpoint=endpoint, templates=True)
     log.info("Importing custom rules (instantiated from rule templates)")
     for key, instantiation_data in config_data["rules"].get("instantiated", {}).items():
         try:
@@ -331,3 +387,13 @@ def convert_for_yaml(original_json: types.ObjectJsonRepr) -> types.ObjectJsonRep
         if category in original_json:
             new_json[category] = convert_rule_list_for_yaml(original_json[category])
     return new_json
+
+
+def third_party(endpoint: platform.Platform) -> list[Rule]:
+    """Returns the list of rules coming from 3rd party plugins"""
+    return [r for r in get_list(endpoint=endpoint).values() if r.repo and r.repo not in SONAR_REPOS and not r.repo.startswith("external_")]
+
+
+def instantiated(endpoint: platform.Platform) -> list[Rule]:
+    """Returns the list of rules that are instantiated"""
+    return [r for r in get_list(endpoint=endpoint).values() if r.template_key is not None]

@@ -1,5 +1,6 @@
 FROM alpine:3.20.3
 LABEL maintainer="olivier.korach@gmail.com" 
+ENV IN_DOCKER="Yes"
 
 ARG USERNAME=sonar
 ARG USER_UID=1000
@@ -18,24 +19,21 @@ ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv ${VIRTUAL_ENV}
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
-WORKDIR /opt/sonar-tools
+WORKDIR /opt/sonar-migration
 
 COPY ./sonar sonar
 COPY ./requirements.txt .
 COPY ./cli cli
-COPY ./setup.py .
-COPY ./sonar-tools .
-COPY ./README.md .
+COPY ./setup_migration.py .
+COPY ./migration migration
+COPY ./migration/README.md .
 COPY ./LICENSE .
 COPY ./sonar/audit sonar/audit
 
 RUN pip install --upgrade pip \
-&& pip install --no-cache-dir -r requirements.txt \
-&& pip install --no-cache-dir --upgrade pip setuptools wheel \
-&& python setup.py bdist_wheel \
-&& pip install dist/*-py3-*.whl --force-reinstall
+&& pip install sonar-migration==0.3 --force-reinstall
 
 USER ${USERNAME}
 WORKDIR /home/${USERNAME}
 
-CMD [ "sonar-tools" ]
+ENTRYPOINT ["sonar-migration"]

@@ -19,7 +19,7 @@
 #
 
 from __future__ import annotations
-
+from queue import Queue
 from typing import Union, Optional
 import datetime as dt
 import json
@@ -253,7 +253,7 @@ class User(sqobject.SqObject):
                     params[p] = kwargs[p]
             if len(params) > 1:
                 self.post(UPDATE_API, params=params)
-            self.set_scm_accounts(kwargs.get("scmAccounts", ""))
+            self.set_scm_accounts(kwargs.get("scmAccounts", None))
             if "login" in kwargs:
                 new_login = kwargs["login"]
                 if new_login not in _OBJECTS:
@@ -373,22 +373,23 @@ class User(sqobject.SqObject):
                 problems.append(Problem(get_rule(RuleId.USER_UNUSED), self, str(self), age))
         return problems
 
-    def to_json(self, full: bool = False) -> types.ObjectJsonRepr:
+    def to_json(self, export_settings: types.ConfigSettings) -> types.ObjectJsonRepr:
         """Exports the user data (login, email, groups, SCM accounts local or not) as dict
 
         :return: User data
         :rtype: dict
         """
         json_data = self._json.copy()
-        scm = self.scm_accounts
-        json_data["scmAccounts"] = util.list_to_csv(scm) if scm else None
-        my_groups = self.groups().copy()
-        if "sonar-users" in my_groups:
-            my_groups.remove("sonar-users")
-        json_data["groups"] = util.list_to_csv(my_groups, ", ", True)
-        if not self.endpoint.is_sonarcloud() and not full and not json_data["local"]:
+        json_data["scmAccounts"] = self.scm_accounts
+        json_data["groups"] = self.groups().copy()
+        if export_settings.get("MODE", "") == "MIGRATION":
+            return json_data
+        if "sonar-users" in json_data["groups"]:
+            json_data["groups"].remove("sonar-users")
+
+        if not self.endpoint.is_sonarcloud() and not export_settings["FULL_EXPORT"] and not json_data["local"]:
             json_data.pop("local")
-        return util.remove_nones(util.filter_export(json_data, SETTABLE_PROPERTIES, full))
+        return util.remove_nones(util.filter_export(json_data, SETTABLE_PROPERTIES, export_settings["FULL_EXPORT"]))
 
 
 def search(endpoint: pf.Platform, params: types.ApiParams = None) -> dict[str, User]:
@@ -403,7 +404,9 @@ def search(endpoint: pf.Platform, params: types.ApiParams = None) -> dict[str, U
     return sqobject.search_objects(endpoint=endpoint, object_class=User, params=params)
 
 
-def export(endpoint: pf.Platform, export_settings: types.ConfigSettings, key_list: types.KeyList = None) -> types.ObjectJsonRepr:
+def export(
+    endpoint: pf.Platform, export_settings: types.ConfigSettings, key_list: Optional[types.KeyList] = None, write_q: Optional[Queue] = None
+) -> types.ObjectJsonRepr:
     """Exports all users in JSON representation
 
     :param Platform endpoint: reference to the SonarQube platform
@@ -415,8 +418,13 @@ def export(endpoint: pf.Platform, export_settings: types.ConfigSettings, key_lis
     log.info("Exporting users")
     u_list = {}
     for u_login, u_obj in sorted(search(endpoint=endpoint).items()):
-        u_list[u_login] = u_obj.to_json(export_settings["FULL_EXPORT"])
-        u_list[u_login].pop("login", None)
+        u_list[u_login] = u_obj.to_json(export_settings)
+        if write_q:
+            write_q.put(u_list[u_login])
+        else:
+            u_list[u_login].pop("login", None)
+    if write_q:
+        write_q.put(None)
     return u_list
 
 

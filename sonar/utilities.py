@@ -26,6 +26,7 @@ from typing import TextIO, Union, Optional
 from http import HTTPStatus
 import sys
 import os
+import math
 import contextlib
 import re
 import json
@@ -45,19 +46,20 @@ SQ_TIME_FORMAT = "%H:%M:%S"
 DEFAULT = "__default__"
 
 
-def check_last_sonar_tools_version() -> None:
+def check_last_version(package_url: str) -> None:
     """Checks last version of sonar-tools on pypi and displays a warning if the currently used version is older"""
     log.info("Checking latest sonar-version on pypi.org")
     try:
-        r = requests.get(url="https://pypi.org/simple/sonar-tools", headers={"Accept": "application/vnd.pypi.simple.v1+json"}, timeout=10)
+        r = requests.get(url=package_url, headers={"Accept": "application/vnd.pypi.simple.v1+json"}, timeout=10)
         r.raise_for_status()
     except (requests.RequestException, requests.exceptions.HTTPError, requests.exceptions.Timeout) as e:
         log.info("Can't access pypi.org, error %s", str(e))
         return
     txt_version = json.loads(r.text)["versions"][-1]
-    log.info("Latest sonar-tools version is %s", txt_version)
+    package_name = package_url.split("/")[-1]
+    log.info("Latest %s released version is %s", package_name, txt_version)
     if tuple(".".split(txt_version)) > tuple(".".split(version.PACKAGE_VERSION)):
-        log.warning("A more recent version of sonar-tools (%s) is available, your are advised to upgrade", txt_version)
+        log.warning("A more recent version of %s (%s) is available, your are advised to upgrade", package_name, txt_version)
 
 
 def token_type(token: str) -> str:
@@ -209,19 +211,21 @@ def csv_to_list(string: str, separator: str = ",") -> list[str]:
     return [s.strip() for s in string.split(separator)]
 
 
-def list_to_csv(array: Union[None, str, list[str]], separator: str = ",", check_for_separator: bool = False) -> Optional[str]:
+def list_to_csv(array: Union[None, str, int, float, list[str]], separator: str = ",", check_for_separator: bool = False) -> Optional[str]:
     """Converts a list of strings to CSV"""
     if isinstance(array, str):
         return csv_normalize(array, separator) if " " in array else array
     if array is None:
         return None
-    if check_for_separator:
-        # Don't convert to string if one array item contains the string separator
-        s = separator.strip()
-        for item in array:
-            if s in item:
-                return array
-    return separator.join([v.strip() for v in array])
+    if isinstance(array, (list, set, tuple)):
+        if check_for_separator:
+            # Don't convert to string if one array item contains the string separator
+            s = separator.strip()
+            for item in array:
+                if s in item:
+                    return array
+        return separator.join([v.strip() for v in array])
+    return str(array)
 
 
 def csv_normalize(string: str, separator: str = ",") -> str:
@@ -352,17 +356,22 @@ def update_json(json_data: dict[str, str], categ: str, subcateg: str, value: any
     return json_data
 
 
-def int_div_ceil(number: int, divider: int) -> int:
-    """Computes rounded up int division"""
-    return (number + divider - 1) // divider
-
-
 def nbr_pages(sonar_api_json: dict[str, str]) -> int:
     """Returns nbr of pages of a paginated Sonar API call"""
+    if "paging" in sonar_api_json:
+        return math.ceil(sonar_api_json["paging"]["total"] / sonar_api_json["paging"]["pageSize"])
+    elif "total" in sonar_api_json:
+        return math.ceil(sonar_api_json["total"] / sonar_api_json["ps"])
+    else:
+        return 1
+
+
+def nbr_total_elements(sonar_api_json: dict[str, str]) -> int:
+    """Returns nbr of elements of a paginated Sonar API call"""
     if "total" in sonar_api_json:
-        return int_div_ceil(sonar_api_json["total"], sonar_api_json["ps"])
+        return sonar_api_json["total"]
     elif "paging" in sonar_api_json:
-        return int_div_ceil(sonar_api_json["paging"]["total"], sonar_api_json["paging"]["pageSize"])
+        return sonar_api_json["paging"]["total"]
     else:
         return 1
 
@@ -585,6 +594,15 @@ def dict_remap(original_dict: dict[str, str], remapping: dict[str, str]) -> dict
         if old in original_dict and new not in remapped_filters:
             remapped_filters[new] = remapped_filters.pop(old)
     return remapped_filters
+
+
+def list_re_value(a_list: list[str], mapping: dict[str, str]) -> list[str]:
+    """Adjust findings search filters based on Sonar version"""
+    if not a_list or len(a_list) == 0:
+        return []
+    for old, new in mapping.items():
+        a_list = [new if v == old else v for v in a_list]
+    return a_list
 
 
 def dict_stringify(original_dict: dict[str, str]) -> dict[str, str]:

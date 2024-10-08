@@ -1,6 +1,7 @@
+#!/bin/bash
 #
 # sonar-tools
-# Copyright (C) 2019-2024 Olivier Korach
+# Copyright (C) 2024 Olivier Korach
 # mailto:olivier.korach AT gmail DOT com
 #
 # This program is free software; you can redistribute it and/or
@@ -18,11 +19,18 @@
 # Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #
 
-"""
+ME="$( basename "${BASH_SOURCE[0]}" )"
+ROOTDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && cd .. && pwd )"
+CONFDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+buildDir="$ROOTDIR/build"
+coverageReport="$buildDir/coverage.xml"
 
-    sonar-tools project version
+[ ! -d $buildDir ] && mkdir $buildDir
 
-"""
-
-PACKAGE_VERSION = "3.5"
-MIGRATION_TOOL_VERSION = "0.3"
+echo "Running tests"
+unreadableSif=$ROOTDIR/test/sif_not_readable.json
+chmod u-rw $unreadableSif
+export SONAR_HOST_URL=${1:-${SONAR_HOST_URL_TEST}}
+coverage run --source=$ROOTDIR -m pytest $ROOTDIR/test/
+coverage xml -o $coverageReport
+chmod u+rw $unreadableSif

@@ -19,7 +19,7 @@
 #
 
 from __future__ import annotations
-from typing import Union
+from typing import Union, Optional
 import json
 from datetime import datetime
 
@@ -433,8 +433,7 @@ class QualityProfile(sq.SqObject):
                     self._projects += [p["key"] for p in data["results"]]
                     page += 1
                     if self.endpoint.version() >= (10, 0, 0):
-                        nb_pages = (data["paging"]["total"] + 500 - 1) // 500
-                        more = nb_pages >= page
+                        more = util.nbr_pages(data) >= page
                     else:
                         more = data["more"]
 
@@ -579,7 +578,9 @@ def hierarchize(qp_list: dict[str, str], endpoint: pf.Platform) -> types.ObjectJ
     return qp_list
 
 
-def export(endpoint: pf.Platform, export_settings: types.ConfigSettings, key_list: types.KeyList = None) -> types.ObjectJsonRepr:
+def export(
+    endpoint: pf.Platform, export_settings: types.ConfigSettings, key_list: Optional[types.KeyList] = None, write_q: Optional[Queue] = None
+) -> types.ObjectJsonRepr:
     """Exports all or a list of quality profiles configuration as dict
 
     :param Platform endpoint: reference to the SonarQube platform
@@ -599,6 +600,9 @@ def export(endpoint: pf.Platform, export_settings: types.ConfigSettings, key_lis
             qp_list[lang] = {}
         qp_list[lang][name] = json_data
     qp_list = hierarchize(qp_list, endpoint)
+    if write_q:
+        write_q.put(qp_list)
+        write_q.put(None)
     return dict(sorted(qp_list.items()))
 
 

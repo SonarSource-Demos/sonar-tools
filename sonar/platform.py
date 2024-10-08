@@ -27,11 +27,13 @@
 from http import HTTPStatus
 import sys
 import os
+from queue import Queue
 from typing import Optional
 import time
 import datetime
 import json
 import tempfile
+import logging
 import requests
 import jprops
 from requests.exceptions import HTTPError
@@ -53,8 +55,10 @@ WRONG_CONFIG_MSG = "Audit config property %s has wrong value %s, skipping audit"
 _NON_EXISTING_SETTING_SKIPPED = "Setting %s does not exist, skipping..."
 _HTTP_ERROR = "%s Error: %s HTTP status code %d - %s"
 
-_SONAR_TOOLS_AGENT = {"user-agent": f"sonar-tools {version.PACKAGE_VERSION}"}
+_SONAR_TOOLS_AGENT = f"sonar-tools {version.PACKAGE_VERSION}"
 _UPDATE_CENTER = "https://raw.githubusercontent.com/SonarSource/sonar-update-center-properties/master/update-center-source.properties"
+
+_NORMAL_HTTP_ERRORS = (HTTPStatus.UNAUTHORIZED, HTTPStatus.NOT_FOUND, HTTPStatus.BAD_REQUEST)
 
 LTA = None
 LATEST = None
@@ -88,6 +92,7 @@ class Platform:
         self.http_timeout = int(http_timeout)
         self.organization = org
         self.__is_sonarcloud = util.is_sonarcloud_url(self.url)
+        self._user_agent = _SONAR_TOOLS_AGENT
 
     def __str__(self) -> str:
         """
@@ -136,6 +141,9 @@ class Platform:
             self.__user_data = json.loads(self.get("api/users/current").text)
         return self.__user_data
 
+    def set_user_agent(self, user_agent: str) -> None:
+        self._user_agent = user_agent
+
     def server_id(self) -> str:
         """
         Returns the SonarQube instance server id
@@ -167,7 +175,7 @@ class Platform:
         if self.is_sonarcloud():
             return {**data, "organization": self.organization}
 
-        return {**data, "version": util.version_to_string(self.version()[:3]), "serverId": self.server_id()}
+        return {**data, "version": util.version_to_string(self.version()[:3]), "serverId": self.server_id(), "plugins": self.plugins()}
 
     def get(self, api: str, params: types.ApiParams = None, exit_on_error: bool = False, mute: tuple[HTTPStatus] = (), **kwargs) -> requests.Response:
         """Makes an HTTP GET request to SonarQube
@@ -210,19 +218,23 @@ class Platform:
     ) -> requests.Response:
         """Makes an HTTP request to SonarQube"""
         api = _normalize_api(api)
-        headers = _SONAR_TOOLS_AGENT
+        headers = {"user-agent": self._user_agent}
         if params is None:
             params = {}
         if self.is_sonarcloud():
             headers["Authorization"] = f"Bearer {self.__token}"
             if kwargs.get("with_organization", True):
                 params["organization"] = self.organization
-        req_type = getattr(request, "__name__", repr(request)).upper()
-        log.debug("%s: %s", req_type, self.__urlstring(api, params))
+        req_type, url = "", ""
+        if log.get_level() >= logging.DEBUG:
+            req_type = getattr(request, "__name__", repr(request)).upper()
+            url = self.__urlstring(api, params)
+            log.debug("%s: %s", req_type, url)
 
         try:
             retry = True
             while retry:
+                start = time.perf_counter_ns()
                 r = request(
                     url=self.url + api,
                     auth=self.__credentials(),
@@ -232,11 +244,12 @@ class Platform:
                     timeout=self.http_timeout,
                 )
                 (retry, new_url) = _check_for_retry(r)
+                log.debug("%s: %s took %d ms", req_type, url, (time.perf_counter_ns() - start) // 1000000)
                 if retry:
                     self.url = new_url
             r.raise_for_status()
         except requests.exceptions.HTTPError as e:
-            if exit_on_error or (r.status_code not in mute and r.status_code == HTTPStatus.UNAUTHORIZED):
+            if exit_on_error:  # or (r.status_code not in mute and r.status_code not in _NORMAL_HTTP_ERRORS):
                 util.log_and_exit(r)
             else:
                 _, msg = util.http_error(r)
@@ -310,9 +323,12 @@ class Platform:
         """
         if self.is_sonarcloud():
             return {}
+        sysinfo = self.sys_info()
+        if "Application Nodes" in sysinfo:
+            sysinfo = sysinfo["Application Nodes"][0]
         if self.version() < (9, 7, 0):
-            return self.sys_info()["Statistics"]["plugins"]
-        return self.sys_info()["Plugins"]
+            return sysinfo["Statistics"]["plugins"]
+        return sysinfo["Plugins"]
 
     def get_settings(self, settings_list: list[str] = None) -> dict[str, any]:
         """Returns a list of (or all) platform global settings value from their key
@@ -781,7 +797,7 @@ def __lta_and_latest() -> tuple[tuple[int, int, int], tuple[int, int, int]]:
         _, tmpfile = tempfile.mkstemp(prefix="sonar-tools", suffix=".txt", text=True)
         try:
             with open(tmpfile, "w", encoding="utf-8") as fp:
-                print(requests.get(_UPDATE_CENTER, headers=_SONAR_TOOLS_AGENT, timeout=10).text, file=fp)
+                print(requests.get(_UPDATE_CENTER, headers={"user-agent": _SONAR_TOOLS_AGENT}, timeout=10).text, file=fp)
             with open(tmpfile, "r", encoding="utf-8") as fp:
                 upd_center_props = jprops.load_properties(fp)
             v = upd_center_props.get("ltsVersion", "9.9.0").split(".")
@@ -854,7 +870,9 @@ def convert_for_yaml(original_json: types.ObjectJsonRepr) -> types.ObjectJsonRep
     return original_json
 
 
-def export(endpoint: Platform, export_settings: types.ConfigSettings, key_list: types.KeyList = None) -> types.ObjectJsonRepr:
+def export(
+    endpoint: Platform, export_settings: types.ConfigSettings, key_list: Optional[types.KeyList] = None, write_q: Optional[Queue] = None
+) -> types.ObjectJsonRepr:
     """Exports all or a list of projects configuration as dict
 
     :param Platform endpoint: reference to the SonarQube platform
@@ -863,4 +881,8 @@ def export(endpoint: Platform, export_settings: types.ConfigSettings, key_list: 
     :return: Platform settings
     :rtype: ObjectJsonRepr
     """
-    return endpoint.export(export_settings)
+    exp = endpoint.export(export_settings)
+    if write_q:
+        write_q.put(exp)
+        write_q.put(None)
+    return exp
